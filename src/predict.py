@@ -1,161 +1,189 @@
-import argparse
 import pandas as pd
 import numpy as np
-import pickle
-import os
-import sys
-
-# Add src to path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from forecast import run_all_forecasts, aggregate_forecasts
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+import warnings
+warnings.filterwarnings("ignore")
 
 
-def compute_roas_forecast(df, channel_forecasts):
-    """Compute ROAS ranges based on historical spend patterns"""
+def prepare_series(df, value_col="revenue"):
+    series = df.groupby("date")[value_col].sum().reset_index()
+    series = series.sort_values("date")
+    series = series.set_index("date")
+
+    # Fill missing dates with 0
+    full_index = pd.date_range(start=series.index.min(),
+                               end=series.index.max(),
+                               freq="D")
+    series = series.reindex(full_index, fill_value=0)
+    series.index.freq = "D"
+
+    return series[value_col]
+
+
+def run_forecast(series, periods=90):
+    """Holt-Winters Exponential Smoothing with confidence intervals"""
+    np.random.seed(42)  # SEED FOR REPRODUCIBILITY
+
+    if len(series) < 14:
+        return None
+
+    try:
+        model = ExponentialSmoothing(
+            series,
+            trend="add",
+            seasonal="add",
+            seasonal_periods=7,
+            initialization_method="estimated"
+        ).fit(optimized=True)
+
+        forecast_mean = model.forecast(periods)
+
+        residuals = model.resid
+        std = residuals.std() * 0.3
+
+        simulations = []
+        for _ in range(500):
+            noise = np.random.normal(0, std, periods)
+            simulations.append(forecast_mean.values + noise)
+
+        sims = np.array(simulations)
+        p10 = np.percentile(sims, 10, axis=0)
+        p50 = np.percentile(sims, 50, axis=0)
+        p90 = np.percentile(sims, 90, axis=0)
+
+        forecast_df = pd.DataFrame({
+            "ds": forecast_mean.index,
+            "yhat": p50,
+            "yhat_lower": p10,
+            "yhat_upper": p90
+        })
+
+        for col in ["yhat", "yhat_lower", "yhat_upper"]:
+            forecast_df[col] = forecast_df[col].clip(lower=0)
+
+        return forecast_df
+
+    except Exception as e:
+        print(f"  Forecast error: {e}")
+        return None
+
+
+def forecast_channel(df, channel, periods=90):
+    channel_df = df[df["channel"] == channel].copy()
+    series = prepare_series(channel_df, "revenue")
+
+    print(f"  >> {channel} ({len(series)} days of data)")
+    forecast = run_forecast(series, periods)
+
+    if forecast is not None:
+        forecast["channel"] = channel
+    return forecast
+
+
+def forecast_campaign_type(df, channel, campaign_type, periods=90):
+    filtered = df[
+        (df["channel"] == channel) &
+        (df["campaign_type"] == campaign_type)
+    ].copy()
+
+    series = prepare_series(filtered, "revenue")
+
+    if len(series) < 14:
+        return None
+
+    forecast = run_forecast(series, periods)
+    if forecast is not None:
+        forecast["channel"] = channel
+        forecast["campaign_type"] = campaign_type
+    return forecast
+
+
+def simulate_budget_impact(df, channel, budget_multiplier=1.2, periods=90):
+    channel_df = df[df["channel"] == channel].copy()
+    avg_roas = channel_df[channel_df["spend"] > 0]["roas"].mean()
+    avg_roas = avg_roas if not np.isnan(avg_roas) else 1.0
+
+    series = prepare_series(channel_df, "revenue")
+    forecast = run_forecast(series, periods)
+
+    if forecast is None:
+        return None
+
+    scale = np.sqrt(budget_multiplier)
+    forecast["yhat"] *= scale
+    forecast["yhat_lower"] *= scale
+    forecast["yhat_upper"] *= scale
+    forecast["channel"] = channel
+    forecast["budget_multiplier"] = budget_multiplier
+    forecast["assumed_roas"] = round(avg_roas, 4)
+    return forecast
+
+
+def aggregate_forecasts(forecasts_list, periods=[30, 60, 90]):
     results = []
-
-    for fc in channel_forecasts:
+    for fc in forecasts_list:
         if fc is None:
             continue
 
-        channel = fc["channel"].iloc[0]
-        channel_df = df[df["channel"] == channel]
+        fc = fc.copy()
+        fc["ds"] = pd.to_datetime(fc["ds"])
+        start_date = fc["ds"].min()
 
-        # Historical average spend per day
-        avg_daily_spend = channel_df[channel_df["spend"] > 0]["spend"].mean()
-        avg_daily_spend = avg_daily_spend if not np.isnan(avg_daily_spend) else 1.0
+        channel = fc["channel"].iloc[0] if "channel" in fc.columns else "all"
+        camp_type = fc["campaign_type"].iloc[0] if "campaign_type" in fc.columns else None
 
-        for period in [30, 60, 90]:
-            projected_spend = avg_daily_spend * period
-
-            fc_copy = fc.copy()
-            fc_copy["ds"] = pd.to_datetime(fc_copy["ds"])
-            start_date = fc_copy["ds"].min()
+        for period in periods:
             end_date = start_date + pd.Timedelta(days=period)
-            window = fc_copy[fc_copy["ds"] <= end_date]
+            window = fc[fc["ds"] <= end_date]
 
-            revenue_p10 = window["yhat_lower"].sum()
-            revenue_p50 = window["yhat"].sum()
-            revenue_p90 = window["yhat_upper"].sum()
-
-            results.append({
-                "channel": channel,
+            row = {
                 "period_days": period,
-                "projected_spend": round(projected_spend, 2),
-                "roas_p10": round(revenue_p10 / projected_spend, 4) if projected_spend > 0 else 0,
-                "roas_p50": round(revenue_p50 / projected_spend, 4) if projected_spend > 0 else 0,
-                "roas_p90": round(revenue_p90 / projected_spend, 4) if projected_spend > 0 else 0,
-            })
+                "channel": channel,
+                "revenue_p10": round(window["yhat_lower"].sum(), 2),
+                "revenue_p50": round(window["yhat"].sum(), 2),
+                "revenue_p90": round(window["yhat_upper"].sum(), 2),
+            }
+            if camp_type:
+                row["campaign_type"] = camp_type
+
+            results.append(row)
 
     return pd.DataFrame(results)
 
 
-def build_output(channel_forecasts, camptype_forecasts, roas_df):
-    """Combine all forecasts into final predictions.csv format"""
+def run_all_forecasts(features_path="features.parquet", periods=90):
+    print("Loading features...")
+    df = pd.read_parquet(features_path)
 
-    # Channel level forecasts
-    channel_summary = aggregate_forecasts(channel_forecasts)
-    channel_summary["campaign_type"] = "ALL"
-    channel_summary["forecast_level"] = "channel"
+    channels = df["channel"].unique()
+    all_channel_forecasts = []
+    all_camptype_forecasts = []
 
-    # Campaign type level forecasts
-    camptype_summary = aggregate_forecasts(camptype_forecasts)
-    camptype_summary["forecast_level"] = "campaign_type"
-    if "campaign_type" not in camptype_summary.columns:
-        camptype_summary["campaign_type"] = "UNKNOWN"
+    print("\nForecasting by channel...")
+    for channel in channels:
+        fc = forecast_channel(df, channel, periods=periods)
+        if fc is not None:
+            all_channel_forecasts.append(fc)
 
-    # Combine
-    combined = pd.concat([channel_summary, camptype_summary], ignore_index=True)
+    print("\nForecasting by campaign type...")
+    for channel in channels:
+        camp_types = df[df["channel"] == channel]["campaign_type"].unique()
+        for ct in camp_types:
+            print(f"  >> {channel} / {ct}")
+            fc = forecast_campaign_type(df, channel, ct, periods=periods)
+            if fc is not None:
+                all_camptype_forecasts.append(fc)
 
-    # Add ROAS
-    combined = combined.merge(
-        roas_df[["channel", "period_days", "roas_p10", "roas_p50", "roas_p90"]],
-        on=["channel", "period_days"],
-        how="left"
-    )
-
-    # Fill missing ROAS for campaign type rows
-    combined["roas_p10"] = combined["roas_p10"].fillna(0)
-    combined["roas_p50"] = combined["roas_p50"].fillna(0)
-    combined["roas_p90"] = combined["roas_p90"].fillna(0)
-
-    # Round all numbers
-    for col in ["revenue_p10", "revenue_p50", "revenue_p90",
-                "roas_p10", "roas_p50", "roas_p90"]:
-        combined[col] = combined[col].round(2)
-
-    # Reorder columns
-    combined = combined[[
-        "forecast_level", "channel", "campaign_type",
-        "period_days",
-        "revenue_p10", "revenue_p50", "revenue_p90",
-        "roas_p10", "roas_p50", "roas_p90"
-    ]]
-
-    combined = combined.sort_values(
-        ["forecast_level", "channel", "period_days"]
-    ).reset_index(drop=True)
-
-    return combined
-
-
-def save_model(df, channel_forecasts, model_path):
-    """Save forecast state as pickle"""
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
-
-    model_data = {
-        "channel_forecasts": channel_forecasts,
-        "feature_columns": list(df.columns),
-        "channels": list(df["channel"].unique()),
-        "date_range": {
-            "start": str(df["date"].min()),
-            "end": str(df["date"].max())
-        }
-    }
-
-    with open(model_path, "wb") as f:
-        pickle.dump(model_data, f)
-
-    print(f"Model saved to {model_path}")
-
-
-def load_model(model_path):
-    """Load pickle model"""
-    with open(model_path, "rb") as f:
-        return pickle.load(f)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--features", default="features.parquet")
-    parser.add_argument("--model", default="./pickle/model.pkl")
-    parser.add_argument("--output", default="./output/predictions.csv")
-    args = parser.parse_args()
-
-    print("Running forecasts...")
-    df, channel_fcs, camptype_fcs = run_all_forecasts(
-        features_path=args.features,
-        periods=90
-    )
-
-    print("\nComputing ROAS forecasts...")
-    roas_df = compute_roas_forecast(df, channel_fcs)
-
-    print("Building output...")
-    predictions = build_output(channel_fcs, camptype_fcs, roas_df)
-
-    print("Saving model pickle...")
-    save_model(df, channel_fcs, args.model)
-
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    predictions.to_csv(args.output, index=False)
-
-    print(f"\nDone! Predictions saved to {args.output}")
-    print(f"Shape: {predictions.shape}")
-    print("\nPreview:")
-    print(predictions.head(10).to_string())
+    return df, all_channel_forecasts, all_camptype_forecasts
 
 
 if __name__ == "__main__":
-    main()
+    df, channel_fcs, camptype_fcs = run_all_forecasts()
+
+    print("\n=== Channel Forecast Summary (30/60/90 days) ===")
+    summary = aggregate_forecasts(channel_fcs)
+    print(summary.to_string())
+
+    print("\n=== Campaign Type Forecast Summary ===")
+    ct_summary = aggregate_forecasts(camptype_fcs)
+    print(ct_summary.to_string())
