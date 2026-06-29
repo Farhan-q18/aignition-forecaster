@@ -39,6 +39,7 @@ def run_forecast(series, periods=90):
         # Generate prediction intervals via Monte Carlo simulation
         residuals = model.resid
         std = residuals.std() * 0.3
+        
 
         simulations = []
         for _ in range(500):
