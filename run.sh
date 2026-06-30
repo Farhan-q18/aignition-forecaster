@@ -5,6 +5,9 @@ set -euo pipefail
 DATA_DIR="${1:-./data}"
 MODEL_PATH="${2:-./pickle/model.pkl}"
 OUTPUT_PATH="${3:-./output/predictions.csv}"
+# Optional: per-channel budget multipliers as JSON string
+# Example: '{"google": 1.2, "meta": 0.9}'
+BUDGETS="${4:-}"
 
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 mkdir -p "$(dirname "$MODEL_PATH")"
@@ -12,9 +15,10 @@ mkdir -p "$(dirname "$MODEL_PATH")"
 echo "=========================================="
 echo "AIgnition Forecaster - Starting Pipeline"
 echo "=========================================="
-echo "Data dir: $DATA_DIR"
-echo "Model path: $MODEL_PATH"
-echo "Output path: $OUTPUT_PATH"
+echo "Data dir:     $DATA_DIR"
+echo "Model path:   $MODEL_PATH"
+echo "Output path:  $OUTPUT_PATH"
+echo "Budgets:      ${BUDGETS:-none}"
 echo "=========================================="
 
 # 1. Generate features from raw data
@@ -27,10 +31,16 @@ python src/generate_features.py \
 # 2. Run forecasting + prediction, save model and predictions
 echo ""
 echo "[2/3] Running forecasts and predictions..."
+BUDGET_ARG=""
+if [ -n "$BUDGETS" ]; then
+    BUDGET_ARG="--budgets '$BUDGETS'"
+fi
+
 python src/predict.py \
     --features features.parquet \
     --model "$MODEL_PATH" \
-    --output "$OUTPUT_PATH"
+    --output "$OUTPUT_PATH" \
+    ${BUDGET_ARG}
 
 # 3. Generate AI insights (optional - won't fail the pipeline if API key missing)
 echo ""
