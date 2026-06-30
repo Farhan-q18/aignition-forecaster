@@ -4,101 +4,145 @@ import pandas as pd
 import numpy as np
 from openai import OpenAI
 
-# Configure OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+MODEL = "gpt-4o-mini"
 
 
-def get_channel_stats(df, channel):
-    """Get historical stats for a channel"""
-    channel_df = df[df["channel"] == channel].copy()
+def get_causal_drivers(df, channel):
+    ch = df[df["channel"] == channel].copy().sort_values("date")
+    last_30 = ch.tail(30)
+    prev_30 = ch.iloc[-60:-30] if len(ch) >= 60 else ch.head(max(1, len(ch) // 2))
 
-    total_revenue = channel_df["revenue"].sum()
-    total_spend = channel_df["spend"].sum()
-    avg_roas = round(total_revenue / total_spend, 2) if total_spend > 0 else 0
-    avg_ctr = round(channel_df["ctr"].mean() * 100, 2)
-    avg_cpc = round(channel_df["cpc"].mean(), 2)
+    def pct(last, prev):
+        if prev == 0:
+            return None
+        return round(((last - prev) / prev) * 100, 1)
 
-    channel_df = channel_df.sort_values("date")
-    last_30 = channel_df.tail(30)["revenue"].sum()
-    prev_30 = channel_df.iloc[-60:-30]["revenue"].sum()
-    trend = round(((last_30 - prev_30) / prev_30) * 100, 1) if prev_30 > 0 else 0
+    rev_last = last_30["revenue"].sum()
+    rev_prev = prev_30["revenue"].sum()
+    spend_last = last_30["spend"].sum()
+    spend_prev = prev_30["spend"].sum()
+    clicks_last = last_30["clicks"].sum()
+    clicks_prev = prev_30["clicks"].sum()
+    imp_last = last_30["impressions"].sum()
+    imp_prev = prev_30["impressions"].sum()
+    conv_last = last_30["conversions"].sum()
+    conv_prev = prev_30["conversions"].sum()
+
+    roas_last = rev_last / spend_last if spend_last > 0 else 0
+    roas_prev = rev_prev / spend_prev if spend_prev > 0 else 0
+    cpc_last = spend_last / clicks_last if clicks_last > 0 else 0
+    cpc_prev = spend_prev / clicks_prev if clicks_prev > 0 else 0
+    ctr_last = clicks_last / imp_last if imp_last > 0 else 0
+    ctr_prev = clicks_prev / imp_prev if imp_prev > 0 else 0
+    cvr_last = conv_last / clicks_last if clicks_last > 0 else 0
+    cvr_prev = conv_prev / clicks_prev if clicks_prev > 0 else 0
 
     return {
-        "channel": channel,
-        "total_revenue": round(total_revenue, 2),
-        "total_spend": round(total_spend, 2),
-        "avg_roas": avg_roas,
-        "avg_ctr_pct": avg_ctr,
-        "avg_cpc": avg_cpc,
-        "revenue_trend_30d_pct": trend,
-        "last_30d_revenue": round(last_30, 2),
-        "prev_30d_revenue": round(prev_30, 2)
+        "revenue_trend_pct": pct(rev_last, rev_prev),
+        "spend_trend_pct": pct(spend_last, spend_prev),
+        "roas_last": round(roas_last, 2),
+        "roas_prev": round(roas_prev, 2),
+        "roas_trend_pct": pct(roas_last, roas_prev),
+        "cpc_last": round(cpc_last, 2),
+        "cpc_prev": round(cpc_prev, 2),
+        "cpc_trend_pct": pct(cpc_last, cpc_prev),
+        "ctr_last_pct": round(ctr_last * 100, 3),
+        "ctr_trend_pct": pct(ctr_last, ctr_prev),
+        "cvr_last_pct": round(cvr_last * 100, 3),
+        "cvr_trend_pct": pct(cvr_last, cvr_prev),
+        "last_30d_revenue": round(rev_last, 2),
+        "prev_30d_revenue": round(rev_prev, 2),
+        "last_30d_spend": round(spend_last, 2),
     }
 
 
+def get_top_campaigns(predictions_df, channel, n=3):
+    rows = predictions_df[
+        (predictions_df["channel"] == channel) &
+        (predictions_df["forecast_level"] == "campaign") &
+        (predictions_df["period_days"] == 30)
+    ].sort_values("revenue_p50", ascending=False).head(n)
+
+    result = []
+    for _, row in rows.iterrows():
+        result.append(
+            f"  - {row['campaign_name']} ({row.get('campaign_type', '')}): "
+            f"${row['revenue_p50']:,.0f} rev, {row['roas_p50']:.2f}x ROAS"
+        )
+    return "\n".join(result) if result else "  No campaign data available"
+
+
 def get_forecast_summary(predictions_df, channel):
-    """Extract forecast numbers for a channel"""
-    channel_preds = predictions_df[
+    rows = predictions_df[
         (predictions_df["channel"] == channel) &
         (predictions_df["forecast_level"] == "channel")
     ]
-
     summary = {}
-    for _, row in channel_preds.iterrows():
-        period = int(row["period_days"])
-        summary[f"{period}d"] = {
+    for _, row in rows.iterrows():
+        p = int(row["period_days"])
+        summary[f"{p}d"] = {
             "revenue_p10": row["revenue_p10"],
             "revenue_p50": row["revenue_p50"],
             "revenue_p90": row["revenue_p90"],
-            "roas_p50": row["roas_p50"]
+            "roas_p10": row["roas_p10"],
+            "roas_p50": row["roas_p50"],
+            "roas_p90": row["roas_p90"],
         }
     return summary
 
 
-def generate_channel_insight(df, predictions_df, channel):
-    """Generate AI insight for a single channel using OpenAI"""
-    stats = get_channel_stats(df, channel)
-    forecast = get_forecast_summary(predictions_df, channel)
+def _fmt_pct(v):
+    if v is None:
+        return "N/A"
+    sign = "+" if v > 0 else ""
+    return f"{sign}{v}%"
 
-    prompt = f"""
-You are a senior digital marketing analyst at a top ecommerce agency.
-Analyze this channel performance data and provide actionable insights.
+
+def generate_channel_insight(df, predictions_df, channel):
+    d = get_causal_drivers(df, channel)
+    fc = get_forecast_summary(predictions_df, channel)
+    top_camps = get_top_campaigns(predictions_df, channel)
+
+    prompt = f"""You are a senior digital marketing analyst at a top ecommerce agency.
+Analyze the data below and write a causally-grounded channel insight.
 
 CHANNEL: {channel.upper()}
 
-HISTORICAL PERFORMANCE:
-- Total Revenue: ${stats['total_revenue']:,}
-- Total Spend: ${stats['total_spend']:,}
-- Average ROAS: {stats['avg_roas']}x
-- Average CTR: {stats['avg_ctr_pct']}%
-- Average CPC: ${stats['avg_cpc']}
-- Revenue Trend (last 30d vs prev 30d): {stats['revenue_trend_30d_pct']}%
-- Last 30d Revenue: ${stats['last_30d_revenue']:,}
-- Previous 30d Revenue: ${stats['prev_30d_revenue']:,}
+PERFORMANCE TREND (last 30d vs prior 30d):
+- Revenue: {_fmt_pct(d['revenue_trend_pct'])}  (${d['last_30d_revenue']:,} vs ${d['prev_30d_revenue']:,})
+- Spend:   {_fmt_pct(d['spend_trend_pct'])}  (last 30d: ${d['last_30d_spend']:,})
+- ROAS:    {d['roas_prev']}x → {d['roas_last']}x  ({_fmt_pct(d['roas_trend_pct'])})
+- CPC:     ${d['cpc_prev']} → ${d['cpc_last']}  ({_fmt_pct(d['cpc_trend_pct'])})
+- CTR:     {d['ctr_last_pct']}%  ({_fmt_pct(d['ctr_trend_pct'])})
+- Conv Rate: {d['cvr_last_pct']}%  ({_fmt_pct(d['cvr_trend_pct'])})
 
-FORECASTED REVENUE:
-- Next 30 days: ${forecast.get('30d', {}).get('revenue_p50', 0):,.0f} (P10: ${forecast.get('30d', {}).get('revenue_p10', 0):,.0f} - P90: ${forecast.get('30d', {}).get('revenue_p90', 0):,.0f})
-- Next 60 days: ${forecast.get('60d', {}).get('revenue_p50', 0):,.0f} (P10: ${forecast.get('60d', {}).get('revenue_p10', 0):,.0f} - P90: ${forecast.get('60d', {}).get('revenue_p90', 0):,.0f})
-- Next 90 days: ${forecast.get('90d', {}).get('revenue_p50', 0):,.0f} (P10: ${forecast.get('90d', {}).get('revenue_p10', 0):,.0f} - P90: ${forecast.get('90d', {}).get('revenue_p90', 0):,.0f})
-- Forecasted ROAS: {forecast.get('30d', {}).get('roas_p50', 0)}x
+TOP CAMPAIGNS — 30d revenue forecast:
+{top_camps}
 
-Please provide:
-1. PERFORMANCE SUMMARY: 2-3 sentences on current channel health
-2. KEY DRIVERS: What is driving performance up or down
-3. FORECAST OUTLOOK: What the forecast range means for the business
-4. BUDGET RECOMMENDATION: Should spend increase, decrease or stay same
-5. RISK FLAGS: Any concerns the agency should watch
+REVENUE FORECAST:
+- 30d: ${fc.get('30d', {}).get('revenue_p50', 0):,.0f}  (P10 ${fc.get('30d', {}).get('revenue_p10', 0):,.0f} – P90 ${fc.get('30d', {}).get('revenue_p90', 0):,.0f})
+- 60d: ${fc.get('60d', {}).get('revenue_p50', 0):,.0f}
+- 90d: ${fc.get('90d', {}).get('revenue_p50', 0):,.0f}
+- ROAS forecast range (30d): {fc.get('30d', {}).get('roas_p10', 0):.2f}x – {fc.get('30d', {}).get('roas_p90', 0):.2f}x
 
-Keep it concise, data-driven and actionable. Max 200 words total.
-"""
+Write exactly 5 labeled sections. Cite specific numbers and causal chains (e.g. "CPC rose X% which compressed ROAS by Y%"). Be direct.
+
+1. PERFORMANCE SUMMARY: What happened and the primary causal driver (2 sentences)
+2. KEY DRIVERS: The 1-2 metrics most responsible for the current trajectory (2 sentences)
+3. FORECAST OUTLOOK: What the P10–P90 spread signals about confidence and risk (1-2 sentences)
+4. BUDGET RECOMMENDATION: Increase / hold / decrease and why (1-2 sentences)
+5. RISK FLAGS: One specific metric to watch that could invalidate the forecast (1 sentence)
+
+Max 220 words total."""
 
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model=MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
-            temperature=0.7
+            max_tokens=380,
+            temperature=0.4,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -106,8 +150,6 @@ Keep it concise, data-driven and actionable. Max 200 words total.
 
 
 def generate_overall_insight(df, predictions_df):
-    """Generate overall blended forecast insight"""
-
     total_30d = predictions_df[
         (predictions_df["forecast_level"] == "channel") &
         (predictions_df["period_days"] == 30)
@@ -127,36 +169,51 @@ def generate_overall_insight(df, predictions_df):
     total_revenue = df["revenue"].sum()
     blended_roas = round(total_revenue / total_spend, 2) if total_spend > 0 else 0
 
-    prompt = f"""
-You are a senior ecommerce marketing strategist.
-Provide an executive summary of the blended forecast across all channels.
+    channel_lines = []
+    for ch in ["google", "meta", "bing"]:
+        row = predictions_df[
+            (predictions_df["channel"] == ch) &
+            (predictions_df["forecast_level"] == "channel") &
+            (predictions_df["period_days"] == 30)
+        ]
+        if not row.empty:
+            rev = row["revenue_p50"].values[0]
+            roas = row["roas_p50"].values[0]
+            share = rev / total_30d * 100 if total_30d > 0 else 0
+            channel_lines.append(
+                f"  - {ch.capitalize()}: ${rev:,.0f} ({share:.0f}% share, {roas:.2f}x ROAS)"
+            )
 
-BLENDED HISTORICAL ROAS: {blended_roas}x
-TOTAL HISTORICAL REVENUE: ${total_revenue:,.0f}
-TOTAL HISTORICAL SPEND: ${total_spend:,.0f}
+    prompt = f"""You are a senior ecommerce marketing strategist.
+Write an executive summary of the blended paid-media forecast.
+
+HISTORICAL BLENDED PERFORMANCE:
+- ROAS: {blended_roas}x
+- Total Revenue: ${total_revenue:,.0f}
+- Total Spend: ${total_spend:,.0f}
 
 BLENDED REVENUE FORECAST:
 - Next 30 days: ${total_30d:,.0f}
 - Next 60 days: ${total_60d:,.0f}
 - Next 90 days: ${total_90d:,.0f}
 
-CHANNELS: Google Ads, Meta Ads, Microsoft (Bing) Ads
+CHANNEL BREAKDOWN (30d forecast):
+{chr(10).join(channel_lines)}
 
-Write a 3-4 sentence executive summary that:
-1. States the overall revenue outlook
-2. Highlights the biggest opportunity
-3. Flags the biggest risk
-4. Gives one strategic recommendation
+Write exactly 4 sentences:
+1. Overall revenue outlook — state the 30/60/90d numbers and the implied run-rate
+2. Biggest opportunity channel — cite its ROAS and revenue share
+3. Biggest risk — name a specific metric or channel
+4. One concrete budget reallocation recommendation
 
-Be direct, confident and data-driven.
-"""
+Max 120 words. Be direct and data-driven."""
 
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model=MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
-            temperature=0.7
+            max_tokens=220,
+            temperature=0.4,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -164,23 +221,20 @@ Be direct, confident and data-driven.
 
 
 def run_insights(df, predictions_df):
-    """Generate all insights and return as dictionary"""
     print("\nGenerating AI insights...")
-
     insights = {}
 
-    print("  >> Generating overall executive summary...")
+    print("  >> Overall executive summary...")
     insights["overall"] = generate_overall_insight(df, predictions_df)
 
     for channel in ["google", "meta", "bing"]:
-        print(f"  >> Generating insight for {channel}...")
+        print(f"  >> {channel}...")
         insights[channel] = generate_channel_insight(df, predictions_df, channel)
 
     return insights
 
 
 def save_insights(insights, output_path="output/insights.json"):
-    """Save insights to JSON file"""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(insights, f, indent=2)
@@ -195,13 +249,9 @@ if __name__ == "__main__":
         print("No OPENAI_API_KEY found in environment. Skipping AI insights.")
         sys.exit(0)
 
-    from forecast import run_all_forecasts
-
-    print("Loading data and forecasts...")
-    df, channel_fcs, camptype_fcs = run_all_forecasts()
-
+    print("Loading data...")
+    df = pd.read_parquet("features.parquet")
     predictions_df = pd.read_csv("output/predictions.csv")
 
     insights = run_insights(df, predictions_df)
-
     save_insights(insights)
