@@ -1,11 +1,11 @@
-import os
+import os 
 import json
 import pandas as pd
 import numpy as np
 from openai import OpenAI
 
 # Configure OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
