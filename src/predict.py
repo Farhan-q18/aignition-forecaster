@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import pickle
 import sys
@@ -67,11 +68,51 @@ def add_roas_columns(summary_df, df):
     return pd.DataFrame(rows)
 
 
+def load_budgets(budgets_arg):
+    """Parse budget multipliers from a JSON string or file path.
+    Expected format: {"google": 1.2, "meta": 0.9, "bing": 1.0}
+    """
+    if not budgets_arg:
+        return {}
+    if os.path.isfile(budgets_arg):
+        with open(budgets_arg) as f:
+            return json.load(f)
+    return json.loads(budgets_arg)
+
+
+def apply_budget_scenarios(channel_summary, budgets):
+    """Scale channel-level forecasts by budget multipliers (diminishing returns)."""
+    rows = []
+    for _, row in channel_summary.iterrows():
+        channel = row["channel"]
+        multiplier = budgets.get(channel)
+        if multiplier is None or multiplier == 1.0:
+            continue
+        scale = np.sqrt(multiplier)
+        new_row = row.copy()
+        new_row["forecast_level"] = "channel_budget"
+        new_row["revenue_p10"] = round(row["revenue_p10"] * scale, 2)
+        new_row["revenue_p50"] = round(row["revenue_p50"] * scale, 2)
+        new_row["revenue_p90"] = round(row["revenue_p90"] * scale, 2)
+        new_row["roas_p10"] = round(row["roas_p10"] * scale, 4)
+        new_row["roas_p50"] = round(row["roas_p50"] * scale, 4)
+        new_row["roas_p90"] = round(row["roas_p90"] * scale, 4)
+        new_row["budget_multiplier"] = multiplier
+        rows.append(new_row)
+    return pd.DataFrame(rows)
+
+
 def main():
     parser = argparse.ArgumentParser(description="AIgnition Forecaster — prediction pipeline")
     parser.add_argument("--features", default="features.parquet")
     parser.add_argument("--model", default="./pickle/model.pkl")
     parser.add_argument("--output", default="./output/predictions.csv")
+    parser.add_argument(
+        "--budgets",
+        default=None,
+        help='Per-channel budget multipliers as JSON string or file path. '
+             'Example: \'{"google": 1.2, "meta": 0.9}\''
+    )
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
@@ -141,16 +182,27 @@ def main():
 
     print(f"  Campaigns forecast: {len(campaign_fcs)}, skipped (insufficient data): {skipped}")
 
+    # --- Budget scenarios ---
+    budgets = load_budgets(args.budgets)
+    budget_summary = pd.DataFrame()
+    if budgets:
+        print(f"\nApplying budget scenarios: {budgets}")
+        budget_summary = apply_budget_scenarios(channel_summary, budgets)
+        if not budget_summary.empty:
+            print(f"  Budget-adjusted rows generated: {len(budget_summary)}")
+
     # --- Combine ---
     parts = [channel_summary, camptype_summary]
     if not campaign_summary.empty:
         parts.append(campaign_summary)
+    if not budget_summary.empty:
+        parts.append(budget_summary)
 
     predictions = pd.concat(parts, ignore_index=True)
-    for col in COL_ORDER:
+    for col in COL_ORDER + ["budget_multiplier"]:
         if col not in predictions.columns:
             predictions[col] = None
-    predictions = predictions[COL_ORDER]
+    predictions = predictions[COL_ORDER + ["budget_multiplier"]]
 
     predictions.to_csv(args.output, index=False)
     print(f"\nPredictions written to {args.output} — {len(predictions)} rows")
