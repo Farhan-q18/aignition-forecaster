@@ -5,7 +5,7 @@ import numpy as np
 from openai import OpenAI
 
 # Configure OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
