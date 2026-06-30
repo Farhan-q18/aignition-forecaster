@@ -153,6 +153,54 @@ def aggregate_forecasts(forecasts_list, periods=[30, 60, 90]):
     return pd.DataFrame(results)
 
 
+def forecast_campaign(df, channel, campaign_name, periods=90):
+    filtered = df[
+        (df["channel"] == channel) &
+        (df["campaign_name"] == campaign_name)
+    ].copy()
+
+    series = prepare_series(filtered, "revenue")
+    if len(series) < 14:
+        return None
+
+    forecast = run_forecast(series, periods)
+    if forecast is not None:
+        forecast["channel"] = channel
+        forecast["campaign_name"] = campaign_name
+        forecast["campaign_type"] = filtered["campaign_type"].mode().iloc[0]
+    return forecast
+
+
+def aggregate_campaign_forecasts(forecasts_list, periods=[30, 60, 90]):
+    results = []
+    for fc in forecasts_list:
+        if fc is None:
+            continue
+
+        fc = fc.copy()
+        fc["ds"] = pd.to_datetime(fc["ds"])
+        start_date = fc["ds"].min()
+
+        channel = fc["channel"].iloc[0]
+        campaign_name = fc["campaign_name"].iloc[0]
+        campaign_type = fc["campaign_type"].iloc[0] if "campaign_type" in fc.columns else None
+
+        for period in periods:
+            end_date = start_date + pd.Timedelta(days=period)
+            window = fc[fc["ds"] <= end_date]
+            results.append({
+                "period_days": period,
+                "channel": channel,
+                "campaign_type": campaign_type,
+                "campaign_name": campaign_name,
+                "revenue_p10": round(window["yhat_lower"].sum(), 2),
+                "revenue_p50": round(window["yhat"].sum(), 2),
+                "revenue_p90": round(window["yhat_upper"].sum(), 2),
+            })
+
+    return pd.DataFrame(results)
+
+
 def run_all_forecasts(features_path="features.parquet", periods=90):
     print("Loading features...")
     df = pd.read_parquet(features_path)
