@@ -1,12 +1,12 @@
-import os 
+import os
 import json
 import pandas as pd
 import numpy as np
 from openai import OpenAI
 
 # Configure OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
-client = OpenAI(api_key=OPENAI_API_KEY)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
 def get_channel_stats(df, channel):
@@ -191,6 +191,10 @@ if __name__ == "__main__":
     import sys
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+    if not OPENAI_API_KEY:
+        print("No OPENAI_API_KEY found in environment. Skipping AI insights.")
+        sys.exit(0)
+
     from forecast import run_all_forecasts
 
     print("Loading data and forecasts...")
@@ -201,8 +205,3 @@ if __name__ == "__main__":
     insights = run_insights(df, predictions_df)
 
     save_insights(insights)
-
-    print("\n=== AI INSIGHTS ===")
-    for key, value in insights.items():
-        print(f"\n--- {key.upper()} ---")
-        print(value)
