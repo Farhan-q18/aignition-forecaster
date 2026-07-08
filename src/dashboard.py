@@ -140,7 +140,8 @@ with st.sidebar:
         st.session_state.theme = "light" if theme_choice else "dark"
         st.rerun()
     st.divider()
-    period = st.select_slider("Forecast window (days)", [30, 60, 90], value=30)
+    period = st.selectbox("Forecast window", [30, 60, 90], index=0,
+                          format_func=lambda d: f"Next {d} days")
     st.markdown(f'<p class="small-muted">History through {features["date"].max().date()}</p>',
                 unsafe_allow_html=True)
 
@@ -211,8 +212,8 @@ if page == "Overview":
                       (features["date"] > end - pd.Timedelta(days=60))]
     rev_delta = (last30["revenue"].sum() - prev30["revenue"].sum()) / max(prev30["revenue"].sum(), 1)
     spend_delta = (last30["spend"].sum() - prev30["spend"].sum()) / max(prev30["spend"].sum(), 1)
-    st.markdown(f"**What changed:** last 30 days brought **${last30['revenue'].sum():,.0f}** revenue "
-                f"({rev_delta:+.0%} vs the prior 30) on **${last30['spend'].sum():,.0f}** spend "
+    st.markdown(f"**What changed:** last 30 days brought **\\${last30['revenue'].sum():,.0f}** revenue "
+                f"({rev_delta:+.0%} vs the prior 30) on **\\${last30['spend'].sum():,.0f}** spend "
                 f"({spend_delta:+.0%}).")
 
     if insights.get("overall"):
