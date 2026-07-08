@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Accept arguments, fall back to defaults for local runs
+# AIgnition Forecaster — scored pipeline entry point.
+#   run.sh [DATA_DIR] [MODEL_PATH] [OUTPUT_PATH] [BUDGETS_JSON]
+# Runs feature generation + prediction end-to-end. No network access, no
+# interactivity. The AI insights layer lives OUTSIDE this scored path
+# (src/anomalies.py + src/llm_insights.py, used by the demo dashboard only).
+
 DATA_DIR="${1:-./data}"
 MODEL_PATH="${2:-./pickle/model.pkl}"
 OUTPUT_PATH="${3:-./output/predictions.csv}"
-# Optional: per-channel budget multipliers as JSON string
-# Example: '{"google": 1.2, "meta": 0.9}'
+# Optional: per-channel budget multipliers as JSON, e.g. '{"google": 1.2}'
 BUDGETS="${4:-}"
 
 mkdir -p "$(dirname "$OUTPUT_PATH")"
-mkdir -p "$(dirname "$MODEL_PATH")"
 
 echo "=========================================="
 echo "AIgnition Forecaster - Starting Pipeline"
@@ -21,31 +24,27 @@ echo "Output path:  $OUTPUT_PATH"
 echo "Budgets:      ${BUDGETS:-none}"
 echo "=========================================="
 
-# 1. Generate features from raw data
 echo ""
-echo "[1/3] Generating features..."
+echo "[1/2] Generating features..."
 python src/generate_features.py \
     --data-dir "$DATA_DIR" \
-    --out features.parquet
+    --out features.parquet \
+    --health-out "$(dirname "$OUTPUT_PATH")/data_health.json"
 
-# 2. Run forecasting + prediction, save model and predictions
 echo ""
-echo "[2/3] Running forecasts and predictions..."
-BUDGET_ARG=""
+echo "[2/2] Running forecasts and predictions..."
 if [ -n "$BUDGETS" ]; then
-    BUDGET_ARG="--budgets '$BUDGETS'"
+    python src/predict.py \
+        --features features.parquet \
+        --model "$MODEL_PATH" \
+        --output "$OUTPUT_PATH" \
+        --budgets "$BUDGETS"
+else
+    python src/predict.py \
+        --features features.parquet \
+        --model "$MODEL_PATH" \
+        --output "$OUTPUT_PATH"
 fi
-
-python src/predict.py \
-    --features features.parquet \
-    --model "$MODEL_PATH" \
-    --output "$OUTPUT_PATH" \
-    ${BUDGET_ARG}
-
-# 3. Generate AI insights (optional - won't fail the pipeline if API key missing)
-echo ""
-echo "[3/3] Generating AI insights..."
-python src/llm_insights.py || echo "  (AI insights skipped - check API key)"
 
 echo ""
 echo "=========================================="

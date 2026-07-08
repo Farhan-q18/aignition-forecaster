@@ -1,181 +1,164 @@
 # Technical Documentation
-## AIgnition Forecaster — Probabilistic Revenue Forecasting
 
----
+## 1. Data unification
 
-## 1. Forecasting Methodology
+Three per-platform CSVs (one row per campaign per day) are unified into one canonical
+table before anything else; every downstream module reads only this table.
 
-The system produces **probabilistic, aggregate-period revenue forecasts** for 30, 60, and 90-day windows at three granularity levels: channel, campaign type, and individual campaign.
+Canonical schema: `date, channel (google/meta/bing), campaign_id, campaign_name,
+campaign_type, spend, revenue, clicks, impressions, conversions, daily_budget`
+plus engineered features (ROAS, CTR, CPC, calendar features, rolling means, lags).
 
-### Model: Holt-Winters Exponential Smoothing
+Per-source handling:
 
-We use **additive Holt-Winters Exponential Smoothing** (also called Triple Exponential Smoothing) from the `statsmodels` library. The model captures:
-
-- **Level** — the baseline revenue signal
-- **Trend** — the additive upward or downward trajectory
-- **Seasonality** — weekly patterns (period = 7 days), since paid media performance follows consistent weekday/weekend cycles
-
-Model parameters are optimized automatically via maximum likelihood estimation (`optimized=True`). No manual tuning is required.
-
-**Why Holt-Winters over other options:**
-
-| Option | Reason for / against |
+| source | key transformations |
 |---|---|
-| Holt-Winters (chosen) | Interpretable, handles trend + weekly seasonality, no external dependencies, fast |
-| Facebook Prophet | More robust to holidays and structural breaks, but heavier dependency and slower |
-| ML models (XGBoost, LSTM) | Higher capacity but require far more data per campaign; most campaigns have <365 days |
-| ARIMA/SARIMA | Similar capability but manual order selection; Holt-Winters is simpler with equivalent performance on short horizons |
+| Google | `metrics_cost_micros / 1,000,000` → dollars (verified against implied CPC); `metrics_conversions_value` → revenue; channel type normalized (`PERFORMANCE_MAX` → `Performance Max`); 14 null `campaign_budget_amount` rows kept and reported in `data_health.json` |
+| Meta | **no revenue or campaign-type columns** — see §1.1 and §1.2; 7 null `daily_budget` rows reported |
+| Bing | clean; types normalized; 85% zero-revenue campaign-days → drives the zero-inflation design (§2.2) |
 
-### Probabilistic Confidence Intervals via Monte Carlo Simulation
+### 1.1 Meta revenue assumption (explicit, flagged)
 
-Rather than using analytical prediction intervals (which assume normality), we simulate uncertainty:
+Meta's `conversion` column is treated as **conversion value (revenue), not a count**:
+its ratio to spend (median ≈ 4.1, mean ≈ 11.2) sits in the same range as Google's
+`conversions_value/cost` (median ≈ 2.6) and Bing's `Revenue/Spend`. Interpreted as a
+count, it would imply implausible per-conversion economics at typical AOVs.
 
-1. Fit the Holt-Winters model and extract model residuals
-2. Compute residual standard deviation, scaled by a conservative factor (0.3) to avoid overconfident intervals
-3. Run 500 Monte Carlo simulations: each simulation adds Gaussian noise drawn from `N(0, σ)` to the point forecast
-4. Report P10, P50, and P90 percentiles across the 500 simulations as the forecast range
+This is a config toggle, not a buried constant:
+`python src/generate_features.py --meta-revenue-mode count --meta-aov 75` switches to
+"count × assumed AOV" if the value interpretation is challenged.
 
-Forecasted values are clipped to zero to prevent negative revenue predictions.
+### 1.2 Campaign taxonomy unification (campaign-consistency deliverable)
 
-### Budget Impact Simulation
+Meta's campaign type is embedded in the campaign name (`Prospecting_DPA_Campaign_04`).
+`src/taxonomy.py` parses names with ordered regex rules into a normalized taxonomy —
+primary type (Prospecting / Remarketing / Generic / Advantage+) plus a Brand/DPA
+sub-tag. Names matching no rule are typed `Unclassified` and surfaced in
+`data_health.json` and the dashboard (for LLM/manual review in the demo layer — the
+scored pipeline never calls a network). Google/Bing types are normalized to the same
+vocabulary. `predict.py` additionally validates campaign consistency (inactive
+campaigns, negative spend, unclassifiable types) before forecasting.
 
-Budget scenarios use a **square-root (diminishing returns) scaling**:
+## 2. Forecasting methodology
 
-```
-scaled_revenue = base_revenue × sqrt(budget_multiplier)
-```
+### 2.1 Core: decomposition + block-bootstrap Monte Carlo
 
-This models the empirical observation that doubling spend rarely doubles revenue — efficiency typically declines as budgets scale up.
+Each series (blended, per-channel, per-campaign-type, per-campaign) is:
 
----
+1. **Aggregated to complete 7-day weeks** counted back from the last observed date
+   (so the forecast starts exactly at data-end + 1 day, and all series share one
+   weekly grid anchored at the global max date — required for joint simulation).
+2. **Decomposed** into `trend × week-of-year seasonal factor + residual`:
+   - *Seasonal factors*: multiplicative week-of-year indices estimated as the median
+     ratio of the series to a 53-week rolling-median trend (the annual window smooths
+     **through** the holiday cycle instead of absorbing it). Each factor pools the
+     target week ±1 (robust to the ~1-week year-over-year shift in holiday timing)
+     and is mildly shrunk toward 1 (factor 0.9). Applied only when the series spans
+     ≥ 80 weeks. Day-of-week seasonality is handled implicitly by weekly aggregation.
+   - *Trend*: 13-week centered rolling median of the **deseasonalized** series
+     (robust to outlier weeks), extrapolated with a Theil-Sen slope over the last
+     26 weeks, **damped ×0.5** (both choices validated by walk-forward backtest).
+3. **Monte-Carlo simulated 10,000×**: residuals are resampled via **moving-block
+   bootstrap** (block = 4 weeks — preserves autocorrelation, unlike iid resampling)
+   and added to `trend × seasonal`; paths are clipped at 0.
+4. **Aggregate-window percentiles**: 30/60/90-day revenue totals are computed **per
+   simulated path** (fractional final week weighted by day count), then P10/P50/P90
+   are taken from the distribution of window totals — *not* by summing per-day
+   percentiles, which misstates aggregate uncertainty.
 
-## 2. Data Preprocessing
+Why not STL with an annual period? With only ~2.4 observed annual cycles, STL's
+seasonal component absorbs most of the noise (measured residual σ ~10× too small),
+producing badly biased points and unrealistically narrow bands. The custom
+decomposition was adopted after that failure mode showed up in backtests.
 
-### Source Datasets
+Why not Prophet/ARIMA out of the box? The dominant structure here is a sharp
+multiplicative holiday spike (peak weeks ≈ 10× baseline, near-identical magnitude in
+both observed years) over a noisy, regime-shifting baseline — the pooled-ratio
+seasonal estimator plus robust trend handles this directly and transparently, and
+every design choice above was accepted/rejected on walk-forward error, not aesthetics.
 
-| Channel | File | Rows | Date range | Campaigns |
-|---|---|---|---|---|
-| Google Ads | `google_ads_campaign_stats.csv` | 19,272 | Jan 2024 – Jun 2026 | 92 |
-| Meta Ads | `meta_ads_campaign_stats.csv` | 3,417 | May 2024 – Jun 2026 | 16 |
-| Microsoft Bing Ads | `bing_campaign_stats.csv` | 2,873 | May 2024 – Jun 2026 | 28 |
+### 2.2 Zero-inflation
 
-### Schema Normalization
+Bing has 85% zero-revenue campaign-days (median Revenue/Spend = 0); Meta 31%. Daily
+Gaussian models are mis-specified for such series. Handling: forecast on **weekly
+sums** (zeros mostly wash out), block-bootstrap the *empirical* residuals (no
+distributional assumption), clip simulated paths at 0. Sparse series at campaign
+grain are skipped below 16 weeks of history rather than fabricated.
 
-Each source has different column names and conventions. The `generate_features.py` module normalizes all three into a unified schema:
+### 2.3 Blended total: joint simulation
 
-| Unified column | Google source | Meta source | Bing source |
-|---|---|---|---|
-| `date` | `segments_date` | `date_start` | `TimePeriod` |
-| `revenue` | `metrics_conversions_value` | `conversion` | `Revenue` |
-| `spend` | `metrics_cost_micros / 1,000,000` | `spend` | `Spend` |
-| `clicks` | `metrics_clicks` | `clicks` | `Clicks` |
-| `impressions` | `metrics_impressions` | `impressions` | `Impressions` |
-| `conversions` | `metrics_conversions` | `0` (not reported) | `Conversions` |
-| `campaign_type` | `campaign_advertising_channel_type` | `Paid_Social` (fixed) | `CampaignType` |
+Channels co-move (shared seasonality and demand). Summing independently simulated
+channel distributions would understate blended uncertainty. Instead, per-channel
+residuals are aligned on the common weekly grid and resampled with the **same
+bootstrap blocks** across channels, preserving the empirical cross-channel
+correlation. Measured effect on the 30-day blended band: P10–P90 of ≈ [292k, 568k]
+jointly vs ≈ [303k, 497k] under independence — the joint band is honestly wider.
 
-**Google spend conversion:** Google reports spend in micros (millionths of a dollar). This is converted: `spend = metrics_cost_micros / 1,000,000`.
+### 2.4 ROAS
 
-**Meta conversions:** Meta does not report a conversions count column; `conversions` is set to 0 for Meta rows. Revenue is taken directly from the `conversion` column (which represents conversion value, not count).
+Near-term spend is treated as **planned** (recent 28-day average daily spend ×
+window length): `roas_pXX = revenue_pXX / planned_spend`. The ROAS band therefore
+reflects revenue uncertainty over a known budget — the operationally relevant
+question ("what return will my planned spend earn?").
 
-### Feature Engineering
+### 2.5 Budget-response curves (simulator; deliberately not an MMM)
 
-After normalization, the following features are derived:
+Per channel and per (channel, campaign-type), weekly `(spend, revenue)` pairs are fit
+with two candidate saturating forms via `scipy.optimize.curve_fit` — Hill
+`v·s/(s+k)` and logarithmic `a·log1p(s/c)` — keeping the lower-SSE form. Curve
+uncertainty comes from resampling the weekly pairs (200 bootstrap refits). A budget
+multiplier `m` rescales the revenue forecast by `f(m·s₀)/f(s₀)` with a P10/P50/P90
+band from the bootstrap fits; curve uncertainty compounds with forecast uncertainty
+(low scale applied to P10, high to P90). Fitted curves live in `model.pkl` — they are
+trained artifacts, never refit in the scored run.
 
-| Feature | Formula |
-|---|---|
-| `roas` | `revenue / spend` (0 if spend = 0) |
-| `ctr` | `clicks / impressions` (0 if impressions = 0) |
-| `cpc` | `spend / clicks` (0 if clicks = 0) |
-| `day_of_week` | 0 = Monday, 6 = Sunday |
-| `is_weekend` | 1 if day_of_week >= 5 |
-| `{col}_7d_avg` | 7-day rolling mean per campaign (revenue, spend, roas, clicks) |
-| `{col}_lag1` | 1-day lag per campaign (revenue, spend, roas) |
-| `{col}_lag7` | 7-day lag per campaign (revenue, spend, roas) |
+Findings on this data: Google is far from saturation (2× budget → ≈1.96× revenue),
+Meta mildly saturated (→ ≈1.87×), **Bing fully saturated (→ ≈1.02×)** — incremental
+Bing spend buys essentially nothing.
 
-Missing values from lag/rolling features at the start of each campaign's history are filled with 0.
+### 2.6 Uncertainty calibration (walk-forward)
 
-### Time Series Preparation for Forecasting
+Band width is **calibrated, not assumed**: per-channel residual scale factors are
+grid-searched so that empirical P10–P90 coverage on walk-forward backtests hits the
+80% target (chosen: blended 2.5, google 2.5, meta 1.5, bing 1.0). Stored in
+`model.pkl`, applied at prediction time.
 
-Before fitting the model, each channel/campaign subset is:
-1. Grouped by date and summed (aggregating across campaigns within the level)
-2. Sorted chronologically
-3. Reindexed to a continuous daily index with missing dates filled as 0
-4. Required to have at least 14 days of data (two full weekly cycles) — series shorter than this are skipped
+## 3. Validation — walk-forward backtest
 
-### Campaign Consistency Validation
+Five historical cutoffs (90–270 days before data end); at each, the model forecasts
+30/60/90 days using only prior data; scored on MAPE, sMAPE and P10–P90 coverage.
+Results ship in `output/backtest_scorecard.csv` and render as the dashboard's
+**Accuracy Scorecard**.
 
-On each pipeline run, campaigns are checked for:
-- **Zero activity**: campaigns where both total revenue and total spend are 0 (likely inactive or misconfigured)
-- **Negative spend**: data quality flag for anomalous records
+Headline (calibrated model): blended MAPE ≈ 32% with **80% band coverage (on
+target)**. Honest failure analysis: the worst windows straddle the holiday ramp —
+with two observed holiday seasons, spike *timing* shifts ±1 week between years and a
+cutoff placed mid-ramp misses high. Channel-level coverage is below target for Meta
+(40%) — reported as-is in the scorecard rather than hidden; the blended number is the
+primary decision quantity and is calibrated.
 
-Validation issues are printed to console but do not halt the pipeline.
+## 4. AI integration strategy
 
----
+Strict grounding contract, in three layers:
 
-## 3. ROAS Forecasting
+1. **Statistical detection first** (`src/anomalies.py`, fully offline): robust
+   z-scores (median/MAD) on decomposition residuals flag revenue outlier weeks;
+   budget-cap proximity flags campaigns spending ≥90% of (or above) their stated
+   daily budget; ROAS drift tests recent 4-week ROAS against the series' own history.
+2. **LLM interpretation** (`src/llm_insights.py`, demo service only): each *detected*
+   anomaly is sent with compact structured context (drivers, forecast bands) and the
+   instruction to ground hypotheses strictly in the numbers given; output is strict
+   JSON `{summary, likely_cause, confidence, recommended_action}` rendered in the UI.
+   Anthropic API first (`ANTHROPIC_MODEL`, default `claude-sonnet-4-6`), OpenAI
+   fallback. Channel narratives and the executive summary use the same grounding.
+3. **Never in the scored path**: `run.sh` makes no network calls of any kind.
 
-The model does not directly forecast spend — only revenue. ROAS forecasts are derived as:
+## 5. Limitations
 
-```
-estimated_spend = historical_daily_avg_spend × forecast_period_days
-roas_p{n} = revenue_p{n} / estimated_spend
-```
-
-This is computed at the appropriate granularity for each row: channel-level rows use channel-level historical spend, campaign-type rows use campaign-type spend, and campaign rows use campaign-level spend.
-
-**Assumption:** future spend closely follows historical average daily spend. This is a simplifying assumption; actual spend may vary with budget changes.
-
----
-
-## 4. Assumptions and Limitations
-
-### Assumptions
-
-- **Attribution is correct**: channel-level revenue attribution from the platform reporting APIs is treated as the source of truth. No cross-channel attribution correction is applied.
-- **Stationarity in trend and seasonality**: Holt-Winters assumes the trend and seasonal patterns observed historically will continue. Structural breaks (new campaigns, major budget changes, market events) are not modeled.
-- **Spend continuity**: future spend is assumed to match historical daily averages unless a budget multiplier is explicitly provided.
-- **Weekly seasonality is dominant**: the model uses `seasonal_periods=7`. Annual or monthly seasonality is not modeled due to limited data history on some channels.
-- **No cross-channel interaction effects**: channels are forecast independently. Cannibalization or complementary effects between channels are not captured.
-
-### Limitations
-
-- Campaigns with fewer than 14 days of data are excluded from forecasting (24 of 136 campaigns).
-- The Monte Carlo confidence intervals assume Gaussian residuals, which may not hold for channels with heavy-tailed revenue distributions.
-- The ROAS forecast is derived from revenue forecasts and historical spend averages — it does not independently model spend dynamics.
-- Media Mix Modeling (MMM) and custom attribution are explicitly out of scope per the challenge constraints.
-- The `seasonal_periods=7` parameter may be suboptimal for channels with strong monthly or promotional cycles.
-
----
-
-## 5. AI Integration Strategy
-
-### LLM Role
-
-OpenAI GPT-4o-mini is used as a **causal reasoning and interpretation layer** — not as a forecasting component. The statistical model produces the numbers; the LLM explains what they mean and why.
-
-### What the LLM receives
-
-For each channel, the prompt includes:
-- Revenue, spend, ROAS, CPC, CTR, and conversion rate for the last 30 days versus the prior 30 days, with computed percentage changes
-- Top 3 campaigns by 30-day revenue forecast (name, type, revenue, ROAS)
-- P10/P50/P90 revenue forecasts for 30, 60, and 90 days
-- ROAS forecast range (P10–P90)
-
-### What the LLM is asked to produce
-
-The prompt enforces a structured 5-section output:
-1. **Performance Summary** — what happened and the primary causal driver
-2. **Key Drivers** — the 1-2 metrics most responsible (with explicit causal language)
-3. **Forecast Outlook** — what the P10–P90 spread signals about confidence
-4. **Budget Recommendation** — increase / hold / decrease with reasoning
-5. **Risk Flags** — one specific metric to watch
-
-Temperature is set to 0.4 (lower than default) to produce consistent, data-grounded outputs rather than creative interpretations.
-
-### Causal Reasoning Design
-
-The prompts are structured to elicit causal chains rather than narrative summaries. For example, the prompt explicitly instructs: *"Cite specific numbers and causal chains (e.g. CPC rose X% which compressed ROAS by Y%)"*. The LLM is given pre-computed trend deltas for CPC, CTR, and conversion rate — the specific metrics that explain ROAS movement — so it can reason about cause and effect rather than just reporting numbers.
-
-### Graceful Degradation
-
-If no `OPENAI_API_KEY` is set, the LLM insights step is skipped without failing the pipeline. The dashboard handles a missing `insights.json` by showing a fallback message.
+- Response curves are correlational (observed spend↔revenue co-variation), not causal
+  incrementality; a full MMM is explicitly out of scope per the brief.
+- Two observed holiday cycles bound how well spike timing can be predicted; forecasts
+  straddling the Q4 ramp carry the widest honest uncertainty.
+- Meta revenue interpretation rests on the §1.1 assumption (toggleable).
+- ROAS bands do not model spend uncertainty (documented as planned-spend by design).
+- Campaign-level series shorter than 16 weeks are not forecast.

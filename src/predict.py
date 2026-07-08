@@ -1,30 +1,42 @@
+"""
+Prediction entry point — the scored pipeline (called by run.sh).
+
+Loads the committed model artifact (pickle/model.pkl: calibrated sigma,
+budget-response curves, config), reads the unified feature table, and writes
+output/predictions.csv with probabilistic 30/60/90-day revenue + ROAS
+forecasts at four levels: blended, channel, campaign_type, campaign.
+
+No network access, no interactivity, no retraining of the artifact —
+the decomposition is estimated on the provided history (that's forecasting),
+but curves and calibration come straight from the pickle.
+"""
+
 import argparse
 import json
 import os
 import pickle
 import sys
 
-import numpy as np
 import pandas as pd
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from forecast import (
-    aggregate_campaign_forecasts,
-    aggregate_forecasts,
-    forecast_campaign,
-    forecast_campaign_type,
-    forecast_channel,
+    forecast_blended,
+    forecast_group,
+    recent_daily_spend,
+    window_percentiles,
 )
+from response_curves import scale_factors
 
-PERIODS = [30, 60, 90]
 COL_ORDER = [
     "forecast_level", "channel", "campaign_type", "campaign_name",
     "period_days", "revenue_p10", "revenue_p50", "revenue_p90",
-    "roas_p10", "roas_p50", "roas_p90",
+    "roas_p10", "roas_p50", "roas_p90", "budget_multiplier",
 ]
 
 
 def validate_campaigns(df):
+    """Campaign-consistency checks surfaced before forecasting."""
     issues = []
     for channel in df["channel"].unique():
         ch_df = df[df["channel"] == channel]
@@ -33,45 +45,68 @@ def validate_campaigns(df):
                 issues.append(f"[{channel}] '{campaign}': zero revenue and zero spend — likely inactive")
             if (grp["spend"] < 0).any():
                 issues.append(f"[{channel}] '{campaign}': negative spend detected")
+        n_unclassified = (ch_df["campaign_type"] == "Unclassified").sum()
+        if n_unclassified:
+            issues.append(f"[{channel}] {n_unclassified} rows with unclassifiable campaign type")
     return issues
 
 
-def estimate_daily_spend(df, channel, campaign_type=None, campaign_name=None):
-    mask = df["channel"] == channel
-    if campaign_type is not None:
-        mask &= df["campaign_type"] == campaign_type
-    if campaign_name is not None:
-        mask &= df["campaign_name"] == campaign_name
-    daily = df[mask].groupby("date")["spend"].sum()
-    return daily.mean() if len(daily) > 0 else 0.0
+def summarize(result, df, mask, periods, level, channel=None,
+              campaign_type=None, campaign_name=None):
+    """Turn a forecast result into 30/60/90-day rows with revenue + ROAS bands.
 
-
-def add_roas_columns(summary_df, df):
+    ROAS treats near-term spend as planned/deterministic (recent 28-day daily
+    average x window length), so the ROAS band inherits the revenue band's
+    shape. Documented as a modeling decision.
+    """
     rows = []
-    for _, row in summary_df.iterrows():
-        channel = row["channel"]
-        campaign_type = row.get("campaign_type") if pd.notna(row.get("campaign_type")) else None
-        campaign_name = row.get("campaign_name") if pd.notna(row.get("campaign_name")) else None
-        period = row["period_days"]
-
-        daily_spend = estimate_daily_spend(df, channel, campaign_type, campaign_name)
+    daily_spend = recent_daily_spend(df, mask)
+    for period in periods:
+        p10, p50, p90 = window_percentiles(result["sims"], period)
         est_spend = daily_spend * period
 
-        def safe_roas(rev):
+        def roas(rev):
             return round(rev / est_spend, 4) if est_spend > 0 else 0.0
 
-        row = row.copy()
-        row["roas_p10"] = safe_roas(row["revenue_p10"])
-        row["roas_p50"] = safe_roas(row["revenue_p50"])
-        row["roas_p90"] = safe_roas(row["revenue_p90"])
-        rows.append(row)
-    return pd.DataFrame(rows)
+        rows.append({
+            "forecast_level": level,
+            "channel": channel,
+            "campaign_type": campaign_type,
+            "campaign_name": campaign_name,
+            "period_days": period,
+            "revenue_p10": round(p10, 2),
+            "revenue_p50": round(p50, 2),
+            "revenue_p90": round(p90, 2),
+            "roas_p10": roas(p10),
+            "roas_p50": roas(p50),
+            "roas_p90": roas(p90),
+            "budget_multiplier": None,
+        })
+    return rows
+
+
+def path_rows(result, level, channel=None, campaign_type=None):
+    """Weekly forecast path (for the dashboard's uncertainty-band charts)."""
+    rows = []
+    hist = result["history"].tail(52)
+    for ds, val in hist.items():
+        rows.append({"forecast_level": level, "channel": channel,
+                     "campaign_type": campaign_type, "week_end": str(ds.date()),
+                     "kind": "history", "p10": None, "p50": round(float(val), 2),
+                     "p90": None})
+    for i, ds in enumerate(result["future_week_ends"]):
+        rows.append({"forecast_level": level, "channel": channel,
+                     "campaign_type": campaign_type, "week_end": str(ds.date()),
+                     "kind": "forecast",
+                     "p10": round(float(result["p10"][i]), 2),
+                     "p50": round(float(result["p50"][i]), 2),
+                     "p90": round(float(result["p90"][i]), 2)})
+    return rows
 
 
 def load_budgets(budgets_arg):
-    """Parse budget multipliers from a JSON string or file path.
-    Expected format: {"google": 1.2, "meta": 0.9, "bing": 1.0}
-    """
+    """Budget multipliers from a JSON string or file path,
+    e.g. {"google": 1.2, "meta": 0.9}."""
     if not budgets_arg:
         return {}
     if os.path.isfile(budgets_arg):
@@ -80,26 +115,34 @@ def load_budgets(budgets_arg):
     return json.loads(budgets_arg)
 
 
-def apply_budget_scenarios(channel_summary, budgets):
-    """Scale channel-level forecasts by budget multipliers (diminishing returns)."""
-    rows = []
-    for _, row in channel_summary.iterrows():
-        channel = row["channel"]
-        multiplier = budgets.get(channel)
+def budget_scenario_rows(prediction_rows, budgets, model):
+    """Re-scale channel forecasts through the fitted response curves.
+
+    Revenue scales by f(m*s0)/f(s0) with a bootstrap band on the curve itself;
+    ROAS re-derives from scaled revenue over scaled spend.
+    """
+    curves = model.get("response_curves", {})
+    out = []
+    for row in prediction_rows:
+        if row["forecast_level"] != "channel":
+            continue
+        multiplier = budgets.get(row["channel"])
         if multiplier is None or multiplier == 1.0:
             continue
-        scale = np.sqrt(multiplier)
-        new_row = row.copy()
-        new_row["forecast_level"] = "channel_budget"
-        new_row["revenue_p10"] = round(row["revenue_p10"] * scale, 2)
-        new_row["revenue_p50"] = round(row["revenue_p50"] * scale, 2)
-        new_row["revenue_p90"] = round(row["revenue_p90"] * scale, 2)
-        new_row["roas_p10"] = round(row["roas_p10"] * scale, 4)
-        new_row["roas_p50"] = round(row["roas_p50"] * scale, 4)
-        new_row["roas_p90"] = round(row["roas_p90"] * scale, 4)
-        new_row["budget_multiplier"] = multiplier
-        rows.append(new_row)
-    return pd.DataFrame(rows)
+        curve = curves.get(f"channel::{row['channel']}")
+        s10, s50, s90 = scale_factors(curve, float(multiplier))
+        new = dict(row)
+        new["forecast_level"] = "channel_budget"
+        # Curve uncertainty compounds with forecast uncertainty: apply the
+        # low scale to P10 and the high scale to P90.
+        new["revenue_p10"] = round(row["revenue_p10"] * s10, 2)
+        new["revenue_p50"] = round(row["revenue_p50"] * s50, 2)
+        new["revenue_p90"] = round(row["revenue_p90"] * s90, 2)
+        for q, s in (("p10", s10), ("p50", s50), ("p90", s90)):
+            new[f"roas_{q}"] = round(row[f"roas_{q}"] * s / multiplier, 4)
+        new["budget_multiplier"] = multiplier
+        out.append(new)
+    return out
 
 
 def main():
@@ -107,110 +150,112 @@ def main():
     parser.add_argument("--features", default="features.parquet")
     parser.add_argument("--model", default="./pickle/model.pkl")
     parser.add_argument("--output", default="./output/predictions.csv")
-    parser.add_argument(
-        "--budgets",
-        default=None,
-        help='Per-channel budget multipliers as JSON string or file path. '
-             'Example: \'{"google": 1.2, "meta": 0.9}\''
-    )
+    parser.add_argument("--paths-output", default=None,
+                        help="Weekly forecast paths CSV (defaults to "
+                             "<output dir>/forecast_paths.csv)")
+    parser.add_argument("--budgets", default=None,
+                        help='Per-channel budget multipliers as JSON string or '
+                             'file path, e.g. \'{"google": 1.2, "meta": 0.9}\'')
     args = parser.parse_args()
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    os.makedirs(os.path.dirname(os.path.abspath(args.model)), exist_ok=True)
+    if not os.path.isfile(args.model):
+        sys.exit(f"ERROR: model artifact not found at {args.model} — "
+                 "the committed pickle/model.pkl is required.")
+    with open(args.model, "rb") as f:
+        model = pickle.load(f)
+    print(f"Loaded model artifact v{model.get('model_version')} "
+          f"(trained on {model.get('trained_on', {}).get('date_min')} -> "
+          f"{model.get('trained_on', {}).get('date_max')})")
 
-    print("Loading features...")
+    out_dir = os.path.dirname(os.path.abspath(args.output))
+    os.makedirs(out_dir, exist_ok=True)
+    paths_output = args.paths_output or os.path.join(out_dir, "forecast_paths.csv")
+
     df = pd.read_parquet(args.features)
-    np.random.seed(42)
+    periods = model.get("periods", [30, 60, 90])
+    n_sims = model.get("n_sims", 10_000)
+    seed = model.get("seed", 42)
+    sigma = model.get("sigma_by_channel", {})
+    end = df["date"].max()
 
     print("\nValidating campaign consistency...")
     issues = validate_campaigns(df)
-    if issues:
-        print(f"  {len(issues)} issue(s) found:")
-        for issue in issues[:10]:
-            print(f"    {issue}")
-        if len(issues) > 10:
-            print(f"    ... and {len(issues) - 10} more")
-    else:
+    for issue in issues[:10]:
+        print(f"  {issue}")
+    if len(issues) > 10:
+        print(f"  ... and {len(issues) - 10} more")
+    if not issues:
         print("  No consistency issues found.")
 
-    channels = df["channel"].unique()
+    rows, paths = [], []
+    all_true = pd.Series(True, index=df.index)
 
-    # --- Channel-level ---
+    # --- Channel level (also feeds the blended joint simulation) ---
     print("\nForecasting by channel...")
-    channel_fcs = []
-    for channel in channels:
-        fc = forecast_channel(df, channel)
-        if fc is not None:
-            channel_fcs.append(fc)
+    channel_results = {}
+    for ch in sorted(df["channel"].unique()):
+        mask = df["channel"] == ch
+        result = forecast_group(df, mask, sigma_scale=sigma.get(ch, 1.0),
+                                seed=seed, n_sims=n_sims, end=end)
+        if result is None:
+            print(f"  >> {ch}: insufficient history, skipped")
+            continue
+        channel_results[ch] = result
+        rows += summarize(result, df, mask, periods, "channel", channel=ch)
+        paths += path_rows(result, "channel", channel=ch)
+        print(f"  >> {ch}: ok")
 
-    channel_summary = aggregate_forecasts(channel_fcs)
-    channel_summary["forecast_level"] = "channel"
-    channel_summary = add_roas_columns(channel_summary, df)
+    # --- Blended (jointly simulated — preserves cross-channel correlation) ---
+    print("Forecasting blended total (joint simulation)...")
+    blended = forecast_blended(channel_results, n_sims=n_sims,
+                               sigma_scale=sigma.get("blended", 1.0), seed=seed)
+    if blended is not None:
+        rows = summarize(blended, df, all_true, periods, "blended") + rows
+        paths = path_rows(blended, "blended") + paths
 
     # --- Campaign-type level ---
-    print("\nForecasting by campaign type...")
-    camptype_fcs = []
-    for channel in channels:
-        for ct in df[df["channel"] == channel]["campaign_type"].unique():
-            print(f"  >> {channel} / {ct}")
-            fc = forecast_campaign_type(df, channel, ct)
-            if fc is not None:
-                camptype_fcs.append(fc)
-
-    camptype_summary = aggregate_forecasts(camptype_fcs)
-    camptype_summary["forecast_level"] = "campaign_type"
-    camptype_summary = add_roas_columns(camptype_summary, df)
+    print("Forecasting by campaign type...")
+    for ch in sorted(df["channel"].unique()):
+        for ct in sorted(df[df["channel"] == ch]["campaign_type"].unique()):
+            mask = (df["channel"] == ch) & (df["campaign_type"] == ct)
+            result = forecast_group(df, mask, sigma_scale=sigma.get(ch, 1.0),
+                                    seed=seed, n_sims=n_sims, end=end)
+            if result is None:
+                continue
+            rows += summarize(result, df, mask, periods, "campaign_type",
+                              channel=ch, campaign_type=ct)
+            paths += path_rows(result, "campaign_type", channel=ch, campaign_type=ct)
 
     # --- Campaign level ---
-    print("\nForecasting by campaign...")
-    campaign_fcs = []
-    skipped = 0
-    for channel in channels:
-        for campaign in df[df["channel"] == channel]["campaign_name"].unique():
-            fc = forecast_campaign(df, channel, campaign)
-            if fc is not None:
-                print(f"  >> {channel} / {campaign}")
-                campaign_fcs.append(fc)
-            else:
-                skipped += 1
+    print("Forecasting by campaign...")
+    n_ok, n_skipped = 0, 0
+    for ch in sorted(df["channel"].unique()):
+        ch_df = df[df["channel"] == ch]
+        for campaign in sorted(ch_df["campaign_name"].unique()):
+            mask = (df["channel"] == ch) & (df["campaign_name"] == campaign)
+            result = forecast_group(df, mask, sigma_scale=sigma.get(ch, 1.0),
+                                    seed=seed, n_sims=n_sims, end=end)
+            if result is None:
+                n_skipped += 1
+                continue
+            ct = df[mask]["campaign_type"].mode().iloc[0]
+            rows += summarize(result, df, mask, periods, "campaign", channel=ch,
+                              campaign_type=ct, campaign_name=campaign)
+            n_ok += 1
+    print(f"  Campaigns forecast: {n_ok}, skipped (insufficient history): {n_skipped}")
 
-    campaign_summary = pd.DataFrame()
-    if campaign_fcs:
-        campaign_summary = aggregate_campaign_forecasts(campaign_fcs)
-        campaign_summary["forecast_level"] = "campaign"
-        campaign_summary = add_roas_columns(campaign_summary, df)
-
-    print(f"  Campaigns forecast: {len(campaign_fcs)}, skipped (insufficient data): {skipped}")
-
-    # --- Budget scenarios ---
+    # --- Budget scenarios (through the fitted response curves) ---
     budgets = load_budgets(args.budgets)
-    budget_summary = pd.DataFrame()
     if budgets:
-        print(f"\nApplying budget scenarios: {budgets}")
-        budget_summary = apply_budget_scenarios(channel_summary, budgets)
-        if not budget_summary.empty:
-            print(f"  Budget-adjusted rows generated: {len(budget_summary)}")
+        print(f"Applying budget scenarios: {budgets}")
+        rows += budget_scenario_rows(rows, budgets, model)
 
-    # --- Combine ---
-    parts = [channel_summary, camptype_summary]
-    if not campaign_summary.empty:
-        parts.append(campaign_summary)
-    if not budget_summary.empty:
-        parts.append(budget_summary)
-
-    predictions = pd.concat(parts, ignore_index=True)
-    for col in COL_ORDER + ["budget_multiplier"]:
-        if col not in predictions.columns:
-            predictions[col] = None
-    predictions = predictions[COL_ORDER + ["budget_multiplier"]]
-
+    predictions = pd.DataFrame(rows)[COL_ORDER]
     predictions.to_csv(args.output, index=False)
     print(f"\nPredictions written to {args.output} — {len(predictions)} rows")
 
-    model_artifact = {"channels": list(channels), "periods": PERIODS}
-    with open(args.model, "wb") as f:
-        pickle.dump(model_artifact, f)
-    print(f"Model artifact saved to {args.model}")
+    pd.DataFrame(paths).to_csv(paths_output, index=False)
+    print(f"Forecast paths written to {paths_output}")
 
 
 if __name__ == "__main__":
