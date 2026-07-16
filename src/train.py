@@ -57,8 +57,8 @@ def main():
     parser.add_argument("--model", default="./pickle/model.pkl")
     parser.add_argument("--skip-calibration", action="store_true",
                         help="Reuse sigma=1.0 everywhere (faster dev loop)")
-    parser.add_argument("--backtest-out", default="output/backtest_scorecard.csv")
-    parser.add_argument("--backtest-detail-out", default="output/backtest_detail.csv")
+    parser.add_argument("--backtest-out", default="scorecard/backtest_scorecard.csv")
+    parser.add_argument("--backtest-detail-out", default="scorecard/backtest_detail.csv")
     args = parser.parse_args()
 
     df = pd.read_parquet(args.features)

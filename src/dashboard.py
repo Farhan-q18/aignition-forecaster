@@ -100,7 +100,7 @@ def load_model():
 
 predictions = load_csv("output/predictions.csv")
 paths = load_csv("output/forecast_paths.csv")
-scorecard = load_csv("output/backtest_scorecard.csv")
+scorecard = load_csv("scorecard/backtest_scorecard.csv")
 insights = load_json("output/insights.json") or {}
 anomalies = load_json("output/anomalies.json") or {}
 health = load_json("output/data_health.json") or {}
@@ -450,7 +450,7 @@ elif page == "Accuracy Scorecard":
 - Campaign-type series with heavy zero-inflation (e.g. small Bing types) have high
   percentage errors on tiny denominators — read absolute numbers there.""")
 
-    detail = load_csv("output/backtest_detail.csv")
+    detail = load_csv("scorecard/backtest_detail.csv")
     if detail is not None:
         with st.expander("Every backtest, individually"):
             st.dataframe(detail, use_container_width=True, hide_index=True)

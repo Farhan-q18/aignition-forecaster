@@ -13,6 +13,9 @@ OUTPUT_PATH="${3:-./output/predictions.csv}"
 # Optional: per-channel budget multipliers as JSON, e.g. '{"google": 1.2}'
 BUDGETS="${4:-}"
 
+# Prefer python3; fall back to python (handles both Linux and macOS conventions)
+PYTHON="$(command -v python3 2>/dev/null || command -v python)"
+
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 
 echo "=========================================="
@@ -26,7 +29,7 @@ echo "=========================================="
 
 echo ""
 echo "[1/2] Generating features..."
-python src/generate_features.py \
+"$PYTHON" src/generate_features.py \
     --data-dir "$DATA_DIR" \
     --out features.parquet \
     --health-out "$(dirname "$OUTPUT_PATH")/data_health.json"
@@ -34,13 +37,13 @@ python src/generate_features.py \
 echo ""
 echo "[2/2] Running forecasts and predictions..."
 if [ -n "$BUDGETS" ]; then
-    python src/predict.py \
+    "$PYTHON" src/predict.py \
         --features features.parquet \
         --model "$MODEL_PATH" \
         --output "$OUTPUT_PATH" \
         --budgets "$BUDGETS"
 else
-    python src/predict.py \
+    "$PYTHON" src/predict.py \
         --features features.parquet \
         --model "$MODEL_PATH" \
         --output "$OUTPUT_PATH"
