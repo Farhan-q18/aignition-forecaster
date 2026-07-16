@@ -163,9 +163,17 @@ def main():
                  "the committed pickle/model.pkl is required.")
     with open(args.model, "rb") as f:
         model = pickle.load(f)
-    print(f"Loaded model artifact v{model.get('model_version')} "
-          f"(trained on {model.get('trained_on', {}).get('date_min')} -> "
-          f"{model.get('trained_on', {}).get('date_max')})")
+
+    model_version = model.get("model_version")
+    trained_on = model.get("trained_on", {})
+    if model_version:
+        print(f"Loaded model artifact v{model_version} "
+              f"(trained on {trained_on.get('date_min')} -> "
+              f"{trained_on.get('date_max')})")
+    else:
+        print("WARNING: model artifact has no version info — "
+              "run `python src/train.py` to regenerate with calibration and "
+              "response curves. Running with defaults (sigma=1.0, sqrt budget scaling).")
 
     out_dir = os.path.dirname(os.path.abspath(args.output))
     os.makedirs(out_dir, exist_ok=True)
