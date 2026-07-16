@@ -14,7 +14,8 @@ OUTPUT_PATH="${3:-./output/predictions.csv}"
 BUDGETS="${4:-}"
 
 # Prefer python3; fall back to python (handles both Linux and macOS conventions)
-PYTHON="$(command -v python3 2>/dev/null || command -v python)"
+# Can be overridden: PYTHON=/path/to/python bash run.sh
+PYTHON="${PYTHON:-$(command -v python3 2>/dev/null || command -v python)}"
 
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 
